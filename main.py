@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import pandas as pd
 import itertools 
 import random    
@@ -10,19 +10,18 @@ from datetime import datetime
 
 app = FastAPI(
     title="AhorraU Backend",
-    description="API Universal: Acepta 'password', 'contrasena' y 'contraseña'.",
-    version="2.9.0"
+    description="API v3.6.0: Validación de usuario_id relajada (acepta string/int/null).",
+    version="3.6.0"
 )
 
 # ===================================================================
-# 🛡️ INTERCEPTORES DE ERRORES (HANDLERS)
+# 🛡️ INTERCEPTORES DE ERRORES (Anti [object Object])
 # ===================================================================
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errores = []
     for error in exc.errors():
-        # Extraemos el nombre del campo que falló
         loc = error.get("loc", ["campo"])
         campo = loc[-1]
         msg = error.get("msg", "Error")
@@ -71,17 +70,16 @@ except FileNotFoundError:
     print("ADVERTENCIA: Archivo 'data.xlsx' no encontrado (Usando modo simulación).")
 
 # -------------------------------------------------------------------
-# MODELOS DE DATOS (SUPER FLEXIBLES)
+# MODELOS DE DATOS (FLEXIBLES PARA EL FRONTEND)
 # -------------------------------------------------------------------
 
 class UsuarioBase(BaseModel):
     nombre: str
     email: str = Field(pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
     universidad: str
-    # Hacemos TODOS opcionales para que Pydantic no se queje si falta uno
     password: Optional[str] = None
     contrasena: Optional[str] = None 
-    contraseña: Optional[str] = None # ¡Soporte para ñ!
+    contraseña: Optional[str] = None 
 
 class LoginRequest(BaseModel):
     email: str
@@ -96,14 +94,20 @@ class Gasto(BaseModel):
     descripcion: Optional[str] = None 
 
 class UpdateGastosPayload(BaseModel):
+    usuario_id: Optional[Union[int, str]] = None 
     gastos: Dict[str, float]
 
 class NuevaCategoriaRequest(BaseModel):
     categoria: str
 
-class FuerzaBrutaSimpleRequest(BaseModel):
-    gasto_actual: float
-    meta: float
+class FuerzaBrutaRequest(BaseModel):
+    # 🔥 CAMBIO AQUÍ: Aceptamos int, string o nada para no romper la validación
+    usuario_id: Optional[Union[int, str]] = None
+    
+    gasto_actual: Optional[float] = None
+    meta: Optional[float] = None
+    gastoSemanal: Optional[float] = None
+    metaGasto: Optional[float] = None
 
 class RecuperarPassRequest(BaseModel):
     email: str
@@ -114,8 +118,12 @@ class EditarPerfilRequest(BaseModel):
     nueva_universidad: Optional[str] = None
 
 class EscenarioRequest(BaseModel):
-    usuario_id: int
-    meta_ahorro_semanal: float 
+    usuario_id: Optional[Union[int, str]] = None
+    meta_ahorro_semanal: Optional[float] = None
+    gasto_actual: Optional[float] = None
+    meta: Optional[float] = None
+    gastoSemanal: Optional[float] = None
+    metaGasto: Optional[float] = None
 
 class OrdenarGastosRequest(BaseModel):
     usuario_id: int
@@ -169,64 +177,77 @@ def quicksort_gastos(lista_gastos: List[Dict]):
     return quicksort_gastos(left) + middle + quicksort_gastos(right)
 
 def algoritmo_fuerza_bruta(gastos_variables: List[NodoGasto], meta_ahorro: float):
+    # Lógica "Best Effort" (Mejor Esfuerzo)
     if meta_ahorro <= 0:
         return {"exito": True, "mensaje": "Presupuesto cumplido.", "ahorro_total": 0, "estrategia": []}
 
-    niveles_reduccion = [0.0, 0.10, 0.25, 0.50]
-    mejor_escenario = None
+    niveles_reduccion = [0.0, 0.10, 0.20, 0.30, 0.40, 0.50]
+    
+    mejor_escenario_absoluto = None
+    maximo_ahorro_posible = 0.0
+    
+    mejor_escenario_cumplido = None
     menor_impacto = float('inf')
-    limit_vars = gastos_variables[:8] 
+    
+    limit_vars = gastos_variables[:6]
     combinaciones = list(itertools.product(niveles_reduccion, repeat=len(limit_vars)))
 
     for combinacion in combinaciones:
         ahorro_acumulado = 0
         impacto_acumulado = 0
         detalles = []
+        
         for i, reduccion in enumerate(combinacion):
             gasto = limit_vars[i]
             ahorro = gasto.monto * reduccion
             ahorro_acumulado += ahorro
             impacto_acumulado += reduccion
+            
             if reduccion > 0:
+                porcentaje_real = int(reduccion * 100)
                 detalles.append({
                     "categoria": gasto.categoria,
-                    "accion": f"Reducir {int(reduccion*100)}%",
+                    "accion": f"Reducir {porcentaje_real}%", 
                     "ahorro_item": round(ahorro, 2),
                     "nuevo_monto": round(gasto.monto - ahorro, 2)
                 })
 
+        escenario_actual = {
+            "exito": True,
+            "ahorro_total": round(ahorro_acumulado, 2),
+            "estrategia": detalles
+        }
+
+        if ahorro_acumulado > maximo_ahorro_posible:
+            maximo_ahorro_posible = ahorro_acumulado
+            mejor_escenario_absoluto = escenario_actual
+
         if ahorro_acumulado >= meta_ahorro:
             if impacto_acumulado < menor_impacto:
                 menor_impacto = impacto_acumulado
-                mejor_escenario = {
-                    "exito": True,
-                    "ahorro_total": round(ahorro_acumulado, 2),
-                    "estrategia": detalles
-                }
+                mejor_escenario_cumplido = escenario_actual
 
-    if mejor_escenario:
-        return mejor_escenario
+    if mejor_escenario_cumplido:
+        return mejor_escenario_cumplido
+    elif mejor_escenario_absoluto:
+        mejor_escenario_absoluto["mensaje"] = f"Meta muy alta. Máximo ahorro posible: S/{maximo_ahorro_posible}"
+        return mejor_escenario_absoluto
     else:
-        return {"exito": False, "mensaje": "Imposible llegar a la meta reduciendo solo variables."}
+        return {"exito": False, "mensaje": "No se encontraron gastos variables para reducir."}
 
 # -------------------------------------------------------------------
-# SECCIÓN 1: AUTENTICACIÓN (LOGIN UNIVERSAL)
+# SECCIÓN 1: AUTENTICACIÓN
 # -------------------------------------------------------------------
 @app.post("/login/", tags=["Autenticación"])
 def login_usuario(credenciales: LoginRequest):
     print(f"👉 LOGIN: {credenciales.email}")
-    
-    # BUSCAMOS LA CONTRASEÑA EN CUALQUIER CAMPO QUE HAYA LLEGADO
     password_final = credenciales.password or credenciales.contrasena or credenciales.contraseña
-    
     if not password_final:
-        # Esto dispara el error como TEXTO gracias al handler blindado
-        raise HTTPException(status_code=422, detail="Falta la contraseña (password/contrasena)")
+        raise HTTPException(status_code=422, detail="Falta la contraseña")
 
     for user in db_usuarios:
         if user['email'] == credenciales.email and user['password'] == password_final:
             print(f"✅ Login OK: {user['nombre']}")
-            # Devuelve estructura anidada correcta
             return {
                 "mensaje": "Login exitoso",
                 "usuario": {
@@ -248,25 +269,21 @@ def recuperar_contrasena(request: RecuperarPassRequest):
     raise HTTPException(status_code=404, detail="El correo no está registrado.")
 
 # -------------------------------------------------------------------
-# SECCIÓN 2: GESTIÓN DE USUARIOS (REGISTRO UNIVERSAL)
+# SECCIÓN 2: GESTIÓN DE USUARIOS
 # -------------------------------------------------------------------
 @app.post("/usuarios/", status_code=201, tags=["Gestión de Usuarios"])
 def registrar_usuario(nuevo_usuario: UsuarioBase):
     global usuario_id_counter
     print(f"👉 REGISTRO: {nuevo_usuario.email}")
-
-    # BUSCAMOS LA CONTRASEÑA DONDE SEA
     password_final = nuevo_usuario.password or nuevo_usuario.contrasena or nuevo_usuario.contraseña
-    
     if not password_final:
-        raise HTTPException(status_code=422, detail="Falta la contraseña. Envíe 'password', 'contrasena' o 'contraseña'.")
+        raise HTTPException(status_code=422, detail="Falta la contraseña.")
 
     for u in db_usuarios:
         if u['email'] == nuevo_usuario.email:
             raise HTTPException(status_code=400, detail="El email ya existe.")
     
     usuario_id_counter += 1
-    
     usuario_data = {
         "id": usuario_id_counter,
         "nombre": nuevo_usuario.nombre,
@@ -277,7 +294,6 @@ def registrar_usuario(nuevo_usuario: UsuarioBase):
     db_usuarios.append(usuario_data)
     print(f"✅ Registro OK: ID {usuario_id_counter}")
     
-    # Devuelve estructura anidada correcta
     return {
         "mensaje": "Registro exitoso",
         "usuario": {
@@ -324,7 +340,13 @@ def obtener_gastos_totales(usuario_id: int):
     }
 
 @app.post("/gastos/actualizar", tags=["Gestión de Gastos"])
-def actualizar_gastos(payload: UpdateGastosPayload, usuario_id: int):
+def actualizar_gastos(payload: UpdateGastosPayload):
+    # Lógica segura para obtener ID
+    try:
+        usuario_id = int(payload.usuario_id)
+    except (TypeError, ValueError):
+        usuario_id = 1 # Fallback si viene mal
+
     global gasto_id_counter, gastos_app
     gastos_app = [g for g in gastos_app if g['usuario_id'] != usuario_id]
     nuevos_gastos = []
@@ -357,28 +379,77 @@ def registrar_gasto_individual(gasto: Gasto):
     return {"mensaje": "Gasto registrado", "gasto": d}
 
 # -------------------------------------------------------------------
-# SECCIÓN 4: ALGORITMOS AVANZADOS
+# SECCIÓN 4: ALGORITMOS AVANZADOS (ENDPOINT INTELIGENTE)
 # -------------------------------------------------------------------
 
 @app.post("/algoritmo/fuerza_bruta", tags=["Algoritmos Avanzados"])
-def calcular_fuerza_bruta_simple(request: FuerzaBrutaSimpleRequest, usuario_id: int):
-    ahorro_necesario = request.gasto_actual - request.meta
+def calcular_fuerza_bruta_simple(request: FuerzaBrutaRequest):
+    # 1. Sanitizar usuario_id (Si viene string o null, usaremos 1)
+    try:
+        usuario_id = int(request.usuario_id)
+    except (TypeError, ValueError):
+        print(f"⚠️ usuario_id inválido o nulo ('{request.usuario_id}'). Usando ID 1 por defecto.")
+        usuario_id = 1
+
+    gasto_final = request.gasto_actual or request.gastoSemanal
+    meta_final = request.meta or request.metaGasto
+    
+    if gasto_final is None or meta_final is None:
+        return {
+            "exito": True, 
+            "mensaje": "Por favor ingresa montos para calcular.", 
+            "ahorro_total": 0, 
+            "estrategia": []
+        }
+
+    ahorro_necesario = gasto_final - meta_final
+    
     mis_gastos = [g for g in gastos_app if g['usuario_id'] == usuario_id]
-    if not mis_gastos: return {"exito": False, "mensaje": "Sin gastos registrados."}
+    
     grafo = GrafoFinanciero(usuario_id)
     for g in mis_gastos: grafo.agregar_gasto(g)
+    
     variables = grafo.obtener_gastos_variables()
-    if not variables: return {"exito": False, "mensaje": "Solo tienes gastos fijos."}
+    
+    if not variables:
+        variables = [
+            NodoGasto(0, "Gastos Generales (Simulado)", gasto_final, "Variable")
+        ]
+    
     res = algoritmo_fuerza_bruta(variables, ahorro_necesario)
-    res["contexto"] = {"gasto_actual": request.gasto_actual, "meta": request.meta}
+    res["contexto"] = {"gasto_actual": gasto_final, "meta": meta_final}
     return res
 
 @app.post("/calcular-escenario", tags=["Algoritmos Avanzados"])
 def calcular_escenario_legacy(request: EscenarioRequest):
-    return calcular_fuerza_bruta_simple(
-        FuerzaBrutaSimpleRequest(gasto_actual=9999, meta=9999-request.meta_ahorro_semanal), 
-        request.usuario_id
-    )
+    # Lógica segura para usuario_id también aquí
+    try:
+        uid = int(request.usuario_id)
+    except:
+        uid = 1
+
+    gasto = request.gasto_actual or request.gastoSemanal
+    meta = request.meta or request.metaGasto
+    
+    if gasto is not None and meta is not None:
+        return calcular_fuerza_bruta_simple(
+            FuerzaBrutaRequest(
+                usuario_id=uid,
+                gasto_actual=gasto,
+                meta=meta
+            )
+        )
+    
+    if request.meta_ahorro_semanal is not None:
+        return calcular_fuerza_bruta_simple(
+            FuerzaBrutaRequest(
+                usuario_id=uid,
+                gasto_actual=9999,
+                meta=9999-request.meta_ahorro_semanal
+            )
+        )
+        
+    return {"exito": False, "mensaje": "Faltan datos de cálculo."}
 
 @app.post("/ordenar-gastos", tags=["Algoritmos Avanzados"])
 def ordenar_gastos(request: OrdenarGastosRequest):
