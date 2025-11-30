@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Dict, Any, List
 import pandas as pd
 import itertools 
@@ -8,23 +10,58 @@ from datetime import datetime
 
 app = FastAPI(
     title="AhorraU Backend",
-    description="API para gestión financiera de estudiantes con Algoritmos de Complejidad.",
-    version="2.2.0"
+    description="API Universal: Acepta 'password', 'contrasena' y 'contraseña'.",
+    version="2.9.0"
 )
 
-# -------------------------------------------------------------------
-# SIMULACIÓN DE BASES DE DATOS
-# -------------------------------------------------------------------
-db_usuarios: List[Dict[str, Any]] = [] 
-usuario_id_counter: int = 0 
+# ===================================================================
+# 🛡️ INTERCEPTORES DE ERRORES (HANDLERS)
+# ===================================================================
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errores = []
+    for error in exc.errors():
+        # Extraemos el nombre del campo que falló
+        loc = error.get("loc", ["campo"])
+        campo = loc[-1]
+        msg = error.get("msg", "Error")
+        errores.append(f"{campo}: {msg}")
+    
+    mensaje_texto = "Datos inválidos: " + "; ".join(errores)
+    print(f"⚠️ Validación falló: {mensaje_texto}")
+    return JSONResponse(status_code=422, content={"detail": mensaje_texto})
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    mensaje_texto = str(exc.detail)
+    print(f"⚠️ Error HTTP ({exc.status_code}): {mensaje_texto}")
+    return JSONResponse(status_code=exc.status_code, content={"detail": mensaje_texto})
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    mensaje_texto = f"Error interno del servidor: {str(exc)}"
+    print(f"❌ CRASH INTERNO: {mensaje_texto}")
+    return JSONResponse(status_code=500, content={"detail": mensaje_texto})
+
+
+# ===================================================================
+# 💾 SIMULACIÓN DE BD
+# ===================================================================
+db_usuarios: List[Dict[str, Any]] = [
+    {
+        "id": 1,
+        "nombre": "Usuario Prueba",
+        "email": "test@upc.edu.pe",
+        "password": "123456",
+        "universidad": "UPC"
+    }
+]
+usuario_id_counter: int = 1 
 gastos_app: List[Dict[str, Any]] = []
 gasto_id_counter: int = 0
-db_presupuestos: Dict[int, float] = {}
-
-# Lista global de categorías permitidas
 categorias_globales: List[str] = ["alquiler", "servicios", "ocio", "alimentos", "transporte", "otros", "educacion"]
 
-# Carga del DataSet
 try:
     df = pd.read_excel('data.xlsx') 
     data_list: List[Dict[str, Any]] = df.to_dict(orient='records')
@@ -34,18 +71,23 @@ except FileNotFoundError:
     print("ADVERTENCIA: Archivo 'data.xlsx' no encontrado (Usando modo simulación).")
 
 # -------------------------------------------------------------------
-# MODELOS DE DATOS (Schemas)
+# MODELOS DE DATOS (SUPER FLEXIBLES)
 # -------------------------------------------------------------------
 
 class UsuarioBase(BaseModel):
     nombre: str
     email: str = Field(pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
-    contrasena: str 
-    universidad: str 
+    universidad: str
+    # Hacemos TODOS opcionales para que Pydantic no se queje si falta uno
+    password: Optional[str] = None
+    contrasena: Optional[str] = None 
+    contraseña: Optional[str] = None # ¡Soporte para ñ!
 
 class LoginRequest(BaseModel):
     email: str
-    contrasena: str
+    password: Optional[str] = None
+    contrasena: Optional[str] = None
+    contraseña: Optional[str] = None
 
 class Gasto(BaseModel):
     usuario_id: int 
@@ -53,7 +95,6 @@ class Gasto(BaseModel):
     monto: float   
     descripcion: Optional[str] = None 
 
-# --- Modelos para Vistas y Algoritmos ---
 class UpdateGastosPayload(BaseModel):
     gastos: Dict[str, float]
 
@@ -79,19 +120,8 @@ class EscenarioRequest(BaseModel):
 class OrdenarGastosRequest(BaseModel):
     usuario_id: int
 
-# --- Modelos para Gráficos (Nuevo) ---
-class ChartData(BaseModel):
-    labels: List[str]
-    data: List[float]
-
-class GastosTotalesResponse(BaseModel):
-    mensual: ChartData
-    semanal: ChartData
-    total_gastos: float
-    promedio_diario: float
-
 # -------------------------------------------------------------------
-# LÓGICA DE ALGORITMOS (CLASES Y FUNCIONES)
+# LÓGICA DE ALGORITMOS
 # -------------------------------------------------------------------
 
 class NodoGasto:
@@ -180,14 +210,35 @@ def algoritmo_fuerza_bruta(gastos_variables: List[NodoGasto], meta_ahorro: float
         return {"exito": False, "mensaje": "Imposible llegar a la meta reduciendo solo variables."}
 
 # -------------------------------------------------------------------
-# SECCIÓN 1: AUTENTICACIÓN
+# SECCIÓN 1: AUTENTICACIÓN (LOGIN UNIVERSAL)
 # -------------------------------------------------------------------
 @app.post("/login/", tags=["Autenticación"])
 def login_usuario(credenciales: LoginRequest):
+    print(f"👉 LOGIN: {credenciales.email}")
+    
+    # BUSCAMOS LA CONTRASEÑA EN CUALQUIER CAMPO QUE HAYA LLEGADO
+    password_final = credenciales.password or credenciales.contrasena or credenciales.contraseña
+    
+    if not password_final:
+        # Esto dispara el error como TEXTO gracias al handler blindado
+        raise HTTPException(status_code=422, detail="Falta la contraseña (password/contrasena)")
+
     for user in db_usuarios:
-        if user['email'] == credenciales.email and user['contrasena'] == credenciales.contrasena:
-            return {"mensaje": "Login exitoso", "usuario_id": user['id'], "nombre": user['nombre']}
-    raise HTTPException(status_code=401, detail="Credenciales inválidas.")
+        if user['email'] == credenciales.email and user['password'] == password_final:
+            print(f"✅ Login OK: {user['nombre']}")
+            # Devuelve estructura anidada correcta
+            return {
+                "mensaje": "Login exitoso",
+                "usuario": {
+                    "id": user['id'],
+                    "nombre": user['nombre'],
+                    "email": user['email'],
+                    "universidad": user['universidad']
+                }
+            }
+    
+    print("❌ Login Fallido")
+    raise HTTPException(status_code=401, detail="Credenciales incorrectas")
 
 @app.post("/recuperar-contrasena", tags=["Autenticación"])
 def recuperar_contrasena(request: RecuperarPassRequest):
@@ -197,23 +248,49 @@ def recuperar_contrasena(request: RecuperarPassRequest):
     raise HTTPException(status_code=404, detail="El correo no está registrado.")
 
 # -------------------------------------------------------------------
-# SECCIÓN 2: GESTIÓN DE USUARIOS
+# SECCIÓN 2: GESTIÓN DE USUARIOS (REGISTRO UNIVERSAL)
 # -------------------------------------------------------------------
 @app.post("/usuarios/", status_code=201, tags=["Gestión de Usuarios"])
 def registrar_usuario(nuevo_usuario: UsuarioBase):
     global usuario_id_counter
+    print(f"👉 REGISTRO: {nuevo_usuario.email}")
+
+    # BUSCAMOS LA CONTRASEÑA DONDE SEA
+    password_final = nuevo_usuario.password or nuevo_usuario.contrasena or nuevo_usuario.contraseña
+    
+    if not password_final:
+        raise HTTPException(status_code=422, detail="Falta la contraseña. Envíe 'password', 'contrasena' o 'contraseña'.")
+
     for u in db_usuarios:
         if u['email'] == nuevo_usuario.email:
             raise HTTPException(status_code=400, detail="El email ya existe.")
+    
     usuario_id_counter += 1
-    usuario_data = nuevo_usuario.model_dump()
-    usuario_data['id'] = usuario_id_counter
+    
+    usuario_data = {
+        "id": usuario_id_counter,
+        "nombre": nuevo_usuario.nombre,
+        "email": nuevo_usuario.email,
+        "password": password_final,
+        "universidad": nuevo_usuario.universidad
+    }
     db_usuarios.append(usuario_data)
-    return {"mensaje": "Registro exitoso", "usuario": {"id": usuario_data['id']}}
+    print(f"✅ Registro OK: ID {usuario_id_counter}")
+    
+    # Devuelve estructura anidada correcta
+    return {
+        "mensaje": "Registro exitoso",
+        "usuario": {
+            "id": usuario_data['id'],
+            "nombre": usuario_data['nombre'],
+            "email": usuario_data['email'],
+            "universidad": usuario_data['universidad']
+        }
+    }
 
 @app.get("/usuarios/", tags=["Gestión de Usuarios"])
 def listar_todos_usuarios():
-    return [{k:v for k,v in u.items() if k!='contrasena'} for u in db_usuarios]
+    return [{k:v for k,v in u.items() if k!='password'} for u in db_usuarios]
 
 @app.get("/usuarios/{usuario_id}", tags=["Gestión de Usuarios"])
 def obtener_perfil_usuario(usuario_id: int):
@@ -232,39 +309,25 @@ def editar_perfil(request: EditarPerfilRequest):
     raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
 # -------------------------------------------------------------------
-# SECCIÓN 3: GESTIÓN DE GASTOS (VISTAS DETALLE Y TOTALES)
+# SECCIÓN 3: GESTIÓN DE GASTOS
 # -------------------------------------------------------------------
 
 @app.get("/gastos/totales", tags=["Gestión de Gastos"])
 def obtener_gastos_totales(usuario_id: int):
-    """
-    **Endpoint solicitado (Gastos Totales):** Devuelve datos para gráficas mensuales/semanales y promedios.
-    """
     mis_gastos = [g for g in gastos_app if g['usuario_id'] == usuario_id]
-    
     total = sum(g['monto'] for g in mis_gastos)
     promedio = round(total / 7, 2) if total > 0 else 0
-
     return {
-        "mensual": {
-            "labels": ["Ene", "Feb", "Mar", "Abr"],
-            "data": [250, 320, 280, total] # Abril refleja el total actual
-        },
-        "semanal": {
-            "labels": ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"],
-            "data": [random.randint(10, 50) for _ in range(7)] # Simulado para la demo
-        },
-        "total_gastos": total,
-        "promedio_diario": promedio
+        "mensual": {"labels": ["Ene", "Feb", "Mar", "Abr"], "data": [250, 320, 280, total]},
+        "semanal": {"labels": ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"], "data": [random.randint(10, 50) for _ in range(7)]},
+        "total_gastos": total, "promedio_diario": promedio
     }
 
 @app.post("/gastos/actualizar", tags=["Gestión de Gastos"])
 def actualizar_gastos(payload: UpdateGastosPayload, usuario_id: int):
-    """Actualiza los gastos desde la vista 'Detalle'."""
     global gasto_id_counter, gastos_app
     gastos_app = [g for g in gastos_app if g['usuario_id'] != usuario_id]
     nuevos_gastos = []
-    
     for categoria, monto in payload.gastos.items():
         if categoria.lower() == "total" or monto <= 0: continue
         gasto_id_counter += 1
@@ -276,7 +339,6 @@ def actualizar_gastos(payload: UpdateGastosPayload, usuario_id: int):
         gastos_app.append(gasto)
         nuevos_gastos.append(gasto)
         if categoria not in categorias_globales: categorias_globales.append(categoria)
-            
     return {"mensaje": "Gastos actualizados", "cantidad": len(nuevos_gastos)}
 
 @app.post("/categorias/nueva", tags=["Gestión de Gastos"])
@@ -300,25 +362,19 @@ def registrar_gasto_individual(gasto: Gasto):
 
 @app.post("/algoritmo/fuerza_bruta", tags=["Algoritmos Avanzados"])
 def calcular_fuerza_bruta_simple(request: FuerzaBrutaSimpleRequest, usuario_id: int):
-    """Calcula ahorro necesario basado en Gasto Actual vs Meta."""
     ahorro_necesario = request.gasto_actual - request.meta
-    
     mis_gastos = [g for g in gastos_app if g['usuario_id'] == usuario_id]
     if not mis_gastos: return {"exito": False, "mensaje": "Sin gastos registrados."}
-
     grafo = GrafoFinanciero(usuario_id)
     for g in mis_gastos: grafo.agregar_gasto(g)
-    
     variables = grafo.obtener_gastos_variables()
     if not variables: return {"exito": False, "mensaje": "Solo tienes gastos fijos."}
-
     res = algoritmo_fuerza_bruta(variables, ahorro_necesario)
     res["contexto"] = {"gasto_actual": request.gasto_actual, "meta": request.meta}
     return res
 
 @app.post("/calcular-escenario", tags=["Algoritmos Avanzados"])
 def calcular_escenario_legacy(request: EscenarioRequest):
-    """Versión Legacy (mantiene compatibilidad)."""
     return calcular_fuerza_bruta_simple(
         FuerzaBrutaSimpleRequest(gasto_actual=9999, meta=9999-request.meta_ahorro_semanal), 
         request.usuario_id
@@ -326,13 +382,11 @@ def calcular_escenario_legacy(request: EscenarioRequest):
 
 @app.post("/ordenar-gastos", tags=["Algoritmos Avanzados"])
 def ordenar_gastos(request: OrdenarGastosRequest):
-    """Quicksort."""
     mis_gastos = [g for g in gastos_app if g['usuario_id'] == request.usuario_id]
     return quicksort_gastos(mis_gastos) if mis_gastos else []
 
 @app.get("/grafos/usuario/{usuario_id}", tags=["Algoritmos Avanzados"])
 def obtener_grafo_usuario(usuario_id: int):
-    """Grafo visual."""
     mis_gastos = [g for g in gastos_app if g['usuario_id'] == usuario_id]
     grafo = GrafoFinanciero(usuario_id)
     for g in mis_gastos: grafo.agregar_gasto(g)
