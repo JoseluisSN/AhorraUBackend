@@ -10,8 +10,8 @@ from datetime import datetime
 
 app = FastAPI(
     title="AhorraU Backend",
-    description="API v3.6.0: Validación de usuario_id relajada (acepta string/int/null).",
-    version="3.6.0"
+    description="API v3.11.0: Respuesta de registro unificada y estándar.",
+    version="3.11.0"
 )
 
 # ===================================================================
@@ -59,7 +59,8 @@ db_usuarios: List[Dict[str, Any]] = [
 usuario_id_counter: int = 1 
 gastos_app: List[Dict[str, Any]] = []
 gasto_id_counter: int = 0
-categorias_globales: List[str] = ["alquiler", "servicios", "ocio", "alimentos", "transporte", "otros", "educacion"]
+categorias_base: List[str] = ["alquiler", "servicios", "ocio", "alimentos", "transporte", "otros", "educacion"]
+categorias_globales = categorias_base.copy()
 
 try:
     df = pd.read_excel('data.xlsx') 
@@ -70,7 +71,7 @@ except FileNotFoundError:
     print("ADVERTENCIA: Archivo 'data.xlsx' no encontrado (Usando modo simulación).")
 
 # -------------------------------------------------------------------
-# MODELOS DE DATOS (FLEXIBLES PARA EL FRONTEND)
+# MODELOS DE DATOS
 # -------------------------------------------------------------------
 
 class UsuarioBase(BaseModel):
@@ -97,13 +98,15 @@ class UpdateGastosPayload(BaseModel):
     usuario_id: Optional[Union[int, str]] = None 
     gastos: Dict[str, float]
 
+class DetalleGastosResponse(BaseModel):
+    usuario_id: int
+    gastos: Dict[str, float]
+
 class NuevaCategoriaRequest(BaseModel):
     categoria: str
 
 class FuerzaBrutaRequest(BaseModel):
-    # 🔥 CAMBIO AQUÍ: Aceptamos int, string o nada para no romper la validación
     usuario_id: Optional[Union[int, str]] = None
-    
     gasto_actual: Optional[float] = None
     meta: Optional[float] = None
     gastoSemanal: Optional[float] = None
@@ -177,7 +180,6 @@ def quicksort_gastos(lista_gastos: List[Dict]):
     return quicksort_gastos(left) + middle + quicksort_gastos(right)
 
 def algoritmo_fuerza_bruta(gastos_variables: List[NodoGasto], meta_ahorro: float):
-    # Lógica "Best Effort" (Mejor Esfuerzo)
     if meta_ahorro <= 0:
         return {"exito": True, "mensaje": "Presupuesto cumplido.", "ahorro_total": 0, "estrategia": []}
 
@@ -248,14 +250,15 @@ def login_usuario(credenciales: LoginRequest):
     for user in db_usuarios:
         if user['email'] == credenciales.email and user['password'] == password_final:
             print(f"✅ Login OK: {user['nombre']}")
+            # Login también usa estructura estándar
             return {
-                "mensaje": "Login exitoso",
                 "usuario": {
                     "id": user['id'],
                     "nombre": user['nombre'],
                     "email": user['email'],
                     "universidad": user['universidad']
-                }
+                },
+                "token": "token-simulado-123"
             }
     
     print("❌ Login Fallido")
@@ -294,14 +297,15 @@ def registrar_usuario(nuevo_usuario: UsuarioBase):
     db_usuarios.append(usuario_data)
     print(f"✅ Registro OK: ID {usuario_id_counter}")
     
+    # 🔥 RESPUESTA UNIFICADA: Exactamente lo que pediste
     return {
-        "mensaje": "Registro exitoso",
         "usuario": {
             "id": usuario_data['id'],
             "nombre": usuario_data['nombre'],
             "email": usuario_data['email'],
             "universidad": usuario_data['universidad']
-        }
+        },
+        "token": "token-simulado-reg"
     }
 
 @app.get("/usuarios/", tags=["Gestión de Usuarios"])
@@ -328,6 +332,66 @@ def editar_perfil(request: EditarPerfilRequest):
 # SECCIÓN 3: GESTIÓN DE GASTOS
 # -------------------------------------------------------------------
 
+@app.get("/gastos/usuario/{usuario_id}", response_model=DetalleGastosResponse, tags=["Gestión de Gastos"])
+def obtener_gastos_usuario(usuario_id: Union[int, str]):
+    try:
+        uid_final = int(usuario_id)
+    except (TypeError, ValueError):
+        print(f"⚠️ ID inválido recibido: '{usuario_id}'. Usando ID 1 por defecto.")
+        uid_final = 1
+
+    mis_gastos = [g for g in gastos_app if g['usuario_id'] == uid_final]
+    
+    resumen_gastos = {cat: 0.0 for cat in categorias_base}
+    
+    for g in mis_gastos:
+        cat_nombre = g['categoria'].lower()
+        monto = g['monto']
+        
+        if cat_nombre in resumen_gastos:
+            resumen_gastos[cat_nombre] += monto
+        else:
+            resumen_gastos[cat_nombre] = monto
+            
+    return {
+        "usuario_id": uid_final,
+        "gastos": resumen_gastos
+    }
+
+@app.post("/gastos/actualizar", tags=["Gestión de Gastos"])
+def actualizar_gastos(payload: UpdateGastosPayload):
+    try:
+        usuario_id = int(payload.usuario_id)
+    except (TypeError, ValueError):
+        usuario_id = 1 
+
+    global gasto_id_counter, gastos_app
+    
+    gastos_app = [g for g in gastos_app if g['usuario_id'] != usuario_id]
+    
+    nuevos_gastos = []
+    for categoria, monto in payload.gastos.items():
+        if categoria.lower() == "total": 
+            continue
+            
+        if monto >= 0: 
+            gasto_id_counter += 1
+            gasto = {
+                "gasto_id": gasto_id_counter, 
+                "usuario_id": usuario_id,
+                "categoria": categoria, 
+                "monto": float(monto),
+                "descripcion": "Edición Manual", 
+                "timestamp": pd.Timestamp.now().isoformat()
+            }
+            gastos_app.append(gasto)
+            nuevos_gastos.append(gasto)
+            
+            if categoria not in categorias_globales: 
+                categorias_globales.append(categoria)
+                
+    return {"exito": True, "mensaje": "Gastos actualizados correctamente"}
+
 @app.get("/gastos/totales", tags=["Gestión de Gastos"])
 def obtener_gastos_totales(usuario_id: int):
     mis_gastos = [g for g in gastos_app if g['usuario_id'] == usuario_id]
@@ -338,30 +402,6 @@ def obtener_gastos_totales(usuario_id: int):
         "semanal": {"labels": ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"], "data": [random.randint(10, 50) for _ in range(7)]},
         "total_gastos": total, "promedio_diario": promedio
     }
-
-@app.post("/gastos/actualizar", tags=["Gestión de Gastos"])
-def actualizar_gastos(payload: UpdateGastosPayload):
-    # Lógica segura para obtener ID
-    try:
-        usuario_id = int(payload.usuario_id)
-    except (TypeError, ValueError):
-        usuario_id = 1 # Fallback si viene mal
-
-    global gasto_id_counter, gastos_app
-    gastos_app = [g for g in gastos_app if g['usuario_id'] != usuario_id]
-    nuevos_gastos = []
-    for categoria, monto in payload.gastos.items():
-        if categoria.lower() == "total" or monto <= 0: continue
-        gasto_id_counter += 1
-        gasto = {
-            "gasto_id": gasto_id_counter, "usuario_id": usuario_id,
-            "categoria": categoria, "monto": float(monto),
-            "descripcion": "Carga manual", "timestamp": pd.Timestamp.now().isoformat()
-        }
-        gastos_app.append(gasto)
-        nuevos_gastos.append(gasto)
-        if categoria not in categorias_globales: categorias_globales.append(categoria)
-    return {"mensaje": "Gastos actualizados", "cantidad": len(nuevos_gastos)}
 
 @app.post("/categorias/nueva", tags=["Gestión de Gastos"])
 def crear_nueva_categoria(request: NuevaCategoriaRequest):
@@ -379,16 +419,14 @@ def registrar_gasto_individual(gasto: Gasto):
     return {"mensaje": "Gasto registrado", "gasto": d}
 
 # -------------------------------------------------------------------
-# SECCIÓN 4: ALGORITMOS AVANZADOS (ENDPOINT INTELIGENTE)
+# SECCIÓN 4: ALGORITMOS AVANZADOS
 # -------------------------------------------------------------------
 
 @app.post("/algoritmo/fuerza_bruta", tags=["Algoritmos Avanzados"])
 def calcular_fuerza_bruta_simple(request: FuerzaBrutaRequest):
-    # 1. Sanitizar usuario_id (Si viene string o null, usaremos 1)
     try:
         usuario_id = int(request.usuario_id)
     except (TypeError, ValueError):
-        print(f"⚠️ usuario_id inválido o nulo ('{request.usuario_id}'). Usando ID 1 por defecto.")
         usuario_id = 1
 
     gasto_final = request.gasto_actual or request.gastoSemanal
@@ -422,7 +460,6 @@ def calcular_fuerza_bruta_simple(request: FuerzaBrutaRequest):
 
 @app.post("/calcular-escenario", tags=["Algoritmos Avanzados"])
 def calcular_escenario_legacy(request: EscenarioRequest):
-    # Lógica segura para usuario_id también aquí
     try:
         uid = int(request.usuario_id)
     except:
